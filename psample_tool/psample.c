@@ -171,6 +171,7 @@ static int show_config_cb(const struct psample_config *config, void *data)
 enum command {
 	COMMAND_LIST_GROUPS,
 	COMMAND_MONITOR,
+	COMMAND_WRITE,
 };
 
 static struct argp_option options[] = {
@@ -182,6 +183,7 @@ static struct argp_option options[] = {
 			"when monitoring, don't show sample notifications" },
 	{"group", 'g', "GROUP_NUM", 0, "for monitor, filter by group" },
 	{"verbose", 'v', 0, 0, "print the packet data" },
+	{"write", 'w', "OUT_FILE", 0, "write sampled packets to file" },
 	{ 0 }
 };
 
@@ -191,6 +193,7 @@ struct psample_tool_options {
 	bool verbose;
 	bool no_config;
 	bool no_sample;
+	const char *out_file;
 };
 
 static const char *cmd_str_get(enum command cmd)
@@ -200,6 +203,8 @@ static const char *cmd_str_get(enum command cmd)
 		return "list-groups";
 	case COMMAND_MONITOR:
 		return "monitor";
+	case COMMAND_WRITE:
+		return "write";
 	default:
 		return "unknown mode";
 	}
@@ -246,14 +251,17 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 		arguments->cmd = COMMAND_MONITOR;
 		break;
 	case 'v':
+		forbid_cmd(arguments->cmd, COMMAND_WRITE, "verbose", state);
 		arguments->verbose = true;
 		break;
 	case 'g':
+		forbid_cmd(arguments->cmd, COMMAND_WRITE, "group", state);
 		arguments->group = atoi(arg);
 		break;
 	case 'c':
 		forbid_cmd(arguments->cmd, COMMAND_LIST_GROUPS, "no-config",
 			   state);
+		forbid_cmd(arguments->cmd, COMMAND_WRITE, "no-config", state);
 		if (arguments->no_sample) {
 			printf("Cant put both no-sample and no-config\n");
 			argp_usage(state);
@@ -263,11 +271,26 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 	case 's':
 		forbid_cmd(arguments->cmd, COMMAND_LIST_GROUPS, "no-sample",
 			   state);
+		forbid_cmd(arguments->cmd, COMMAND_WRITE, "no-sample", state);
 		if (arguments->no_config) {
 			printf("Cant put both no-sample and no-config\n");
 			argp_usage(state);
 		}
 		arguments->no_sample = true;
+		break;
+	case 'w':
+		arguments->cmd = COMMAND_WRITE;
+		arguments->out_file = arg;
+		forbid_argument(arguments->no_config, "no-config",
+				arguments->cmd, state);
+		forbid_argument(arguments->no_sample, "no-sample",
+				arguments->cmd, state);
+		forbid_argument(arguments->verbose, "verbose", arguments->cmd,
+				state);
+		if (arguments->group >= 0) {
+			printf("Cant put both group and write\n");
+			argp_usage(state);
+		}
 		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
@@ -284,10 +307,11 @@ int main(int argc, char **argv)
 	struct psample_tool_options arguments = {0};
 	struct psample_handle *handle;
 	bool first_run = true;
-	int err;
+	int err = 0;
 
 	arguments.cmd = COMMAND_MONITOR;
 	arguments.group = -1;
+	arguments.out_file = NULL;
 	argp_parse(&argp, argc, argv, 0, 0, &arguments);
 
 	psample_set_log_level(PSAMPLE_LOG_INFO);
@@ -296,7 +320,8 @@ int main(int argc, char **argv)
 	if (!handle)
 		return -1;
 
-	if (arguments.cmd == COMMAND_MONITOR) {
+	switch (arguments.cmd) {
+	case COMMAND_MONITOR:
 		if (arguments.group != -1)
 			psample_bind_group(handle, arguments.group);
 
@@ -310,11 +335,21 @@ int main(int argc, char **argv)
 			psample_dispatch(handle, show_message_cb,
 					 &arguments.verbose, show_config_cb,
 					 &arguments.verbose, true);
-	} else {
+		break;
+	case COMMAND_LIST_GROUPS:
 		psample_group_foreach(handle, show_group_cb, &first_run);
+		break;
+	case COMMAND_WRITE:
+		err = psample_pcap_init(arguments.out_file, handle);
+		if (err)
+			break;
+
+		psample_write_pcap_dispatch(handle);
+		psample_pcap_fini(handle);
+		break;
 	}
 
 	psample_close(handle);
 
-	return 0;
+	return err;
 }
