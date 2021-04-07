@@ -33,12 +33,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pcap/pcap.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <libmnl/libmnl.h>
 #include <linux/psample.h>
 #include <linux/genetlink.h>
 #include <linux/filter.h>
+#include <linux/if_arp.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <psample.h>
@@ -70,10 +72,18 @@ struct psample_config {
 	struct nlattr **tb;
 };
 
+struct psample_pcap {
+	long snaplen;
+	char *pcap_buf;
+	pcap_t *pcap_handle;
+	pcap_dumper_t *pcap_dumper;
+};
+
 struct psample_handle {
 	struct mnlg_socket *sample_nlh;
 	struct mnlg_socket *control_nlh;
 	struct sock_fprog sample_filter_fprog;
+	struct psample_pcap psample_pcap;
 };
 
 void psample_set_log_level(enum psample_log_level level)
@@ -188,6 +198,151 @@ void psample_close(struct psample_handle *handle)
 	if (handle->sample_filter_fprog.filter)
 		free(handle->sample_filter_fprog.filter);
 	free(handle);
+}
+
+/* Based on https://www.tcpdump.org/linktypes/LINKTYPE_LINUX_SLL.html */
+struct linux_sll {
+	__be16 pkttype;
+	__be16 hatype;
+	__be16 halen;
+	unsigned char addr[8];
+	__be16 family;
+};
+
+static int psample_pcap_buf_init(struct psample_handle *handle)
+{
+	struct linux_sll sll;
+
+	/* The wireshark netlink dissector expects netlink messages to start
+	 * with a Linux cooked header (SLL), so include it before each packet.
+	 */
+	memset(&sll, 0, sizeof(sll));
+	sll.pkttype = htons(PACKET_OUTGOING);
+	sll.hatype = htons(ARPHRD_NETLINK);
+	sll.family = htons(AF_NETLINK);
+
+	handle->psample_pcap.pcap_buf = calloc(1, handle->psample_pcap.snaplen);
+	if (!handle->psample_pcap.pcap_buf) {
+		perror("calloc failed");
+		return -1;
+	}
+
+	memcpy(handle->psample_pcap.pcap_buf, &sll, sizeof(sll));
+
+	return 0;
+}
+
+static void psample_pcap_buf_fini(struct psample_handle *handle)
+{
+	free(handle->psample_pcap.pcap_buf);
+}
+
+static void psample_pcap_write(void *data, unsigned char *buf, int len)
+{
+	struct psample_handle *handle = data;
+	struct pcap_pkthdr hdr;
+	int pkt_len;
+
+	if (len + sizeof(struct linux_sll) < handle->psample_pcap.snaplen)
+		pkt_len = len + sizeof(struct linux_sll);
+	else
+		pkt_len = handle->psample_pcap.snaplen - sizeof(struct linux_sll);
+
+	memcpy(handle->psample_pcap.pcap_buf + sizeof(struct linux_sll), buf, pkt_len);
+
+	hdr.caplen = pkt_len;
+	hdr.len = pkt_len;
+	gettimeofday(&hdr.ts, NULL);
+
+	pcap_dump((unsigned char *) handle->psample_pcap.pcap_dumper, &hdr,
+		  (const unsigned char *) handle->psample_pcap.pcap_buf);
+	/* In case packets are written to stdout, make sure each packet is
+	 * immediately written and not buffered.
+	 */
+	fflush(NULL);
+}
+
+static int psample_pcap_genl_init(struct psample_handle *handle)
+{
+	/* In order for wireshark to be able to invoke the psample dissector,
+	 * it must learn about the mapping between the generic netlink
+	 * family ID and its name from this dump.
+	 *
+	 * Reference:
+	 * https://www.wireshark.org/lists/wireshark-users/201907/msg00027.html
+	 */
+	struct nlmsghdr *nlh;
+	int err;
+
+	nlh = mnlg_msg_prepare(handle->sample_nlh, CTRL_CMD_GETFAMILY,
+			       NLM_F_REQUEST | NLM_F_ACK, GENL_ID_CTRL, 1);
+
+	mnl_attr_put_u16(nlh, CTRL_ATTR_FAMILY_ID, handle->sample_nlh->id);
+	err = mnlg_socket_send(handle->sample_nlh, nlh);
+	if (err < 0)
+		return err;
+
+	do {
+		err = mnl_socket_recvfrom(handle->sample_nlh->nl,
+					  handle->sample_nlh->buf,
+					  MNL_SOCKET_BUFFER_SIZE);
+		if (err <= 0)
+			break;
+
+		psample_pcap_write(handle, handle->sample_nlh->buf,
+				   MNL_SOCKET_BUFFER_SIZE);
+
+	} while (err > 0);
+
+	return err;
+}
+
+int psample_pcap_init(const char *out_file, struct psample_handle *handle)
+{
+	int err;
+
+	handle->psample_pcap.snaplen = 0xffff;
+
+	handle->psample_pcap.pcap_handle =
+		pcap_open_dead(DLT_NETLINK, handle->psample_pcap.snaplen);
+	if (!handle->psample_pcap.pcap_handle) {
+		perror("pcap_open_dead");
+		return -1;
+	}
+
+	handle->psample_pcap.pcap_dumper =
+		pcap_dump_open(handle->psample_pcap.pcap_handle, out_file);
+	if (!handle->psample_pcap.pcap_dumper) {
+		pcap_perror(handle->psample_pcap.pcap_handle, "pcap_dump_open");
+		goto err_dump_open;
+	}
+
+	err = psample_pcap_buf_init(handle);
+	if (err)
+		goto err_buf_init;
+
+	err = psample_pcap_genl_init(handle);
+	if (err) {
+		fprintf(stderr, "Failed to dump generic netlink families\n");
+		goto err_genl_init;
+	}
+
+	return 0;
+
+err_genl_init:
+	psample_pcap_buf_fini(handle);
+err_buf_init:
+	pcap_dump_close(handle->psample_pcap.pcap_dumper);
+err_dump_open:
+	pcap_close(handle->psample_pcap.pcap_handle);
+	return -1;
+}
+
+void psample_pcap_fini(struct psample_handle *handle)
+{
+	psample_pcap_buf_fini(handle);
+	pcap_dump_close(handle->psample_pcap.pcap_dumper);
+	pcap_close(handle->psample_pcap.pcap_handle);
 }
 
 static int attr_cb(const struct nlattr *attr, void *data)
@@ -377,6 +532,43 @@ int psample_dispatch(struct psample_handle *handle, psample_msg_cb msg_cb,
 	}
 
 	return event_handler_data.cb_retval;
+}
+
+static int psample_socket_recv_write(struct mnlg_socket *nlg, void* data_write)
+{
+	int err;
+
+	do {
+		err = mnl_socket_recvfrom(nlg->nl, nlg->buf,
+					  MNL_SOCKET_BUFFER_SIZE);
+		if (err <= 0)
+			break;
+
+		psample_pcap_write(data_write, nlg->buf,
+				   MNL_SOCKET_BUFFER_SIZE);
+
+	} while (err > 0);
+
+	return err;
+}
+
+int psample_write_pcap_dispatch(struct psample_handle *handle)
+{
+	int err;
+
+	if (!handle) {
+		LOG_ERR("handle not initalized");
+		return -ENOMEM;
+	}
+
+	psample_set_blocking(handle, true);
+	err = psample_socket_recv_write(handle->sample_nlh, handle);
+	if (err < 0) {
+		LOG_ERR("Could not recv: %s", strerror(errno));
+		return -errno;
+	}
+
+	return 0;
 }
 
 struct psample_group_handler_data {
