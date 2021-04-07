@@ -420,7 +420,8 @@ int psample_group_foreach(struct psample_handle *handle,
 	int err;
 
 	nlhdr = mnlg_msg_prepare(handle->control_nlh, PSAMPLE_CMD_GET_GROUP,
-				 flags);
+				 flags, handle->control_nlh->id,
+				 handle->control_nlh->version);
 
 	err = mnlg_socket_send(handle->control_nlh, nlhdr);
 	if (err < 0) {

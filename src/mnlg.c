@@ -20,18 +20,9 @@
 
 #include "mnlg.h"
 
-struct mnlg_socket {
-	struct mnl_socket *nl;
-	char *buf;
-	uint32_t id;
-	uint8_t version;
-	unsigned int seq;
-	unsigned int portid;
-};
-
-static struct nlmsghdr *__mnlg_msg_prepare(struct mnlg_socket *nlg, uint8_t cmd,
-					   uint16_t flags, uint32_t id,
-					   uint8_t version)
+struct nlmsghdr *mnlg_msg_prepare(struct mnlg_socket *nlg, uint8_t cmd,
+				  uint16_t flags, uint32_t id,
+				  uint8_t version)
 {
 	struct nlmsghdr *nlh;
 	struct genlmsghdr *genl;
@@ -47,12 +38,6 @@ static struct nlmsghdr *__mnlg_msg_prepare(struct mnlg_socket *nlg, uint8_t cmd,
 	genl->version = version;
 
 	return nlh;
-}
-
-struct nlmsghdr *mnlg_msg_prepare(struct mnlg_socket *nlg, uint8_t cmd,
-				  uint16_t flags)
-{
-	return __mnlg_msg_prepare(nlg, cmd, flags, nlg->id, nlg->version);
 }
 
 int mnlg_socket_send(struct mnlg_socket *nlg, const struct nlmsghdr *nlh)
@@ -161,8 +146,8 @@ int mnlg_socket_group_add(struct mnlg_socket *nlg, const char *group_name)
 	struct group_info group_info;
 	int err;
 
-	nlh = __mnlg_msg_prepare(nlg, CTRL_CMD_GETFAMILY,
-				 NLM_F_REQUEST | NLM_F_ACK, GENL_ID_CTRL, 1);
+	nlh = mnlg_msg_prepare(nlg, CTRL_CMD_GETFAMILY,
+			       NLM_F_REQUEST | NLM_F_ACK, GENL_ID_CTRL, 1);
 	mnl_attr_put_u16(nlh, CTRL_ATTR_FAMILY_ID, nlg->id);
 
 	err = mnlg_socket_send(nlg, nlh);
@@ -245,8 +230,8 @@ struct mnlg_socket *mnlg_socket_open(const char *family_name, uint8_t version)
 
 	nlg->portid = mnl_socket_get_portid(nlg->nl);
 
-	nlh = __mnlg_msg_prepare(nlg, CTRL_CMD_GETFAMILY,
-				 NLM_F_REQUEST | NLM_F_ACK, GENL_ID_CTRL, 1);
+	nlh = mnlg_msg_prepare(nlg, CTRL_CMD_GETFAMILY,
+			       NLM_F_REQUEST | NLM_F_ACK, GENL_ID_CTRL, 1);
 	mnl_attr_put_strz(nlh, CTRL_ATTR_FAMILY_NAME, family_name);
 
 	err = mnlg_socket_send(nlg, nlh);
